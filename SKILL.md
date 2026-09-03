@@ -3,7 +3,7 @@ name: new-model-hunt
 description: >-
   Whole-repository adversarial review and patch run for trying out a new model:
   parallel correctness hunters and code-clarity reviewers per subsystem plus
-  cross-cutting lenses, one skeptic per finding prompted to refute it, a
+  cross-cutting lenses, a skeptic per hunt prompted to refute each finding, a
   consolidated report saved to the Desktop, then per-subsystem patch agents,
   build/test, one commit per subsystem, a UI-copy pass, and (on request) the
   release. Use when the user says /new-model-hunt, "run the hunt with the new
@@ -23,7 +23,7 @@ in the parent session (the exceptions are listed under Patch).
 
 | File | Purpose |
 | --- | --- |
-| `SKILL_DIR/scripts/hunt.py` | `prompts` · `skeptics` · `status` · `report` · `args` — all prompt wording lives here |
+| `SKILL_DIR/scripts/hunt.py` | `prompts` · `skeptics` · `plan` · `status` · `report` · `args` — all prompt wording lives here |
 | `SKILL_DIR/workflows/hunt.js` | Claude Code `Workflow` fan-out over the prompt files — optional |
 | `SKILL_DIR/references/roles.md` | What each role is and the bar it is held to |
 | `SKILL_DIR/references/lessons.md` | What went wrong on previous runs and the rule each left behind |
@@ -40,9 +40,20 @@ Parse `$ARGUMENTS`:
 - `--no-patch` — stop after the report
 - `--no-copy` — skip the UI-copy phase
 - `--release <x.y.z>` — after commits, cut the release with the repo's own release target
+- `--skeptic-model <name>` — model for phase 2 (default: the host's cheaper tier)
+- `--batch <n>` — findings per skeptic prompt (default 8; `--solo` is one agent per finding)
+- `--max-agents <n>` — agents per wave (default 8)
 - Every other token is a path or subsystem key to restrict the run to
 
 Defaults: both tracks, patch after the user picks, no release.
+
+## Budget
+
+Every agent is a fresh context that re-reads the notes and its own files, so **agent count is what the run costs**. `python3 "$SKILL_DIR/scripts/hunt.py" plan "$RUN/run.json"` prints the count for each phase before you spend it; show it to the user after the carve and again before phase 2.
+
+Launch in **waves** of `--max-agents`. State lives in `$RUN`, so a wave that dies against a rate or session limit costs one wave: rerun `hunt.py status` and relaunch what is missing. Between waves, tell the user how many agents are left.
+
+The hunters are the model under test and run on `--model`. The skeptics are the verification harness and run on `--skeptic-model`; a verifier independent of the model under test is the point of the phase, not a compromise. Record both under `models` in `run.json`, and pass the model on each agent launch.
 
 ## Phase 0 — Preflight and carve
 
@@ -58,6 +69,7 @@ mkdir -p "$RUN"
 cat > "$RUN/run.json" <<EOF
 { "root": "<abs repo path>", "notes": ["<abs CLAUDE.md>", ...], "model": "<model>",
   "run_dir": "$RUN",
+  "models": { "hunt": "<model>", "skeptic": "<skeptic-model>", "patch": "<model>" },
   "subsystems": [ { "key": "cli", "files": "cmd/** src/cli/**" }, ... ],
   "lenses": [ { "key": "wire-contract", "files": "...", "focus": "..." }, ... ] }
 EOF
@@ -70,7 +82,7 @@ Tell the user in two lines: N subsystems, M lenses, which tracks, where the run 
 
 One agent per prompt file under `$RUN/prompts/`. Correctness hunters (`correctness-<key>.md`) and clarity reviewers (`clarity-<key>.md`) run at the same time; they are independent. Each prompt already tells the agent to write its JSON to `$RUN/findings/<track>-<key>.json` and to touch nothing in the repo.
 
-- Launch them all in one batch, in the background. Read-only agent type when the host has one.
+- Launch them in waves of `--max-agents`, in the background. Read-only agent type when the host has one.
 - Do **not** poll. Run `python3 hunt.py status "$RUN/run.json"` when a completion notice arrives, or when nothing has arrived for 20 minutes; it lists expected outputs that are still missing.
 - An agent that produced no file after ~60 minutes is stalled. Relaunch that one prompt (same file). Never wait on a stalled agent; never relaunch one that has written its file.
 - If the host has the Claude Code `Workflow` tool, `hunt.js` fans the agents out for you: `python3 hunt.py args "$RUN/run.json" hunt` prints the `args` to pass (only prompts still without a findings file). The agents write the same files, so nothing else in this skill changes; run it again with `args … skeptics` in phase 2.
@@ -78,10 +90,17 @@ One agent per prompt file under `$RUN/prompts/`. Correctness hunters (`correctne
 ## Phase 2 — Skeptics (parallel, read-only, refute by default)
 
 ```bash
-python3 "$SKILL_DIR/scripts/hunt.py" skeptics "$RUN/run.json"
+python3 "$SKILL_DIR/scripts/hunt.py" skeptics "$RUN/run.json"        # --batch <n> · --solo
 ```
 
-Writes one prompt per finding under `$RUN/skeptics/`, skipping findings that already have a verdict. Before launching, scan the list it prints for **duplicates** — same file and the same defect reported by two hunts or by both tracks. For each duplicate write `{"alias": "<track>-<key>-<n>"}` into its verdict file instead of launching a skeptic; the report folds it under the original. Then launch every remaining skeptic in one batch.
+Writes one prompt per hunt under `$RUN/skeptics/`, each carrying up to `--batch` of that hunt's findings, and skips findings that already have a verdict. Grouping by hunt is what makes this phase affordable: one skeptic reads the notes and that subsystem's files once and then judges each finding on its own, where one agent per finding re-reads the same file once per finding. `--solo` restores one agent per finding when you want the strictest independence and can pay for it.
+
+Two things the command settles before any agent runs, and prints:
+
+- A finding whose `file:line` anchor does not exist in the repo is refuted on the spot — a hallucinated anchor is the cheapest refutation there is, and it costs no agent.
+- A finding that repeats another's defect (same file, anchors within 3 lines, titles that agree) is aliased to it, and the report folds it under the original. This is the duplicate scan the orchestrator used to do by eye.
+
+Each skeptic writes one `verdicts/<id>.json` per finding, so `status` and `report` read the same layout as ever. Launch the prompts in waves, as in phase 1.
 
 The skeptic's bar (in the prompt): the finding stands only when the failure can be narrated end to end from the code, is not something the notes rule out, and its fix does not add a speculative guard or a new concept. A misplaced or overstated finding that survives gets a `corrected_title`; the corrected title is what the report shows and what the patcher follows.
 

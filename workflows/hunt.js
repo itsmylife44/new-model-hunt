@@ -7,15 +7,18 @@
 //   python3 scripts/hunt.py skeptics run.json && python3 scripts/hunt.py args run.json skeptics # -> args
 //   Workflow({ scriptPath: "<SKILL_DIR>/workflows/hunt.js", args })
 //
-// args: { "phase": "hunt" | "skeptics", "prompt_files": ["<abs path>", ...], "read_only_agent_type": "Explore" }
+// args: { "phase": "hunt" | "skeptics", "prompt_files": ["<abs path>", ...], "read_only_agent_type": "Explore",
+//         "batched": true, "agent_model": "<name>" }
+// A batched skeptic prompt carries several findings and returns one verdict per finding; hunt.py
+// writes the files either way, so hunt.py status / report work unchanged.
 // Every agent writes its JSON where its prompt says, so hunt.py status / report work unchanged.
 export const meta = {
   name: 'new-model-hunt',
-  description: 'Parallel correctness hunters and clarity reviewers, then one skeptic per finding prompted to refute it',
+  description: 'Parallel correctness hunters and clarity reviewers, then a skeptic per hunt prompted to refute each finding',
   whenToUse: 'When the user runs /new-model-hunt on a repository',
   phases: [
     { title: 'Hunt', detail: 'one read-only hunter or reviewer per prompt file' },
-    { title: 'Verify', detail: 'one read-only skeptic per finding' },
+    { title: 'Verify', detail: 'one read-only skeptic per hunt, adjudicating that hunt\'s findings' },
   ],
 }
 
@@ -44,24 +47,41 @@ const FINDINGS_SCHEMA = {
     },
   },
 }
-const VERDICT_SCHEMA = {
+const VERDICT_FIELDS = {
+  refuted: { type: 'boolean' },
+  reason: { type: 'string' },
+  severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+  corrected_title: { type: 'string' },
+}
+const VERDICT_REQUIRED = ['refuted', 'reason', 'severity', 'corrected_title']
+const VERDICT_SCHEMA = { type: 'object', required: VERDICT_REQUIRED, properties: VERDICT_FIELDS }
+const BATCH_VERDICT_SCHEMA = {
   type: 'object',
-  required: ['refuted', 'reason', 'severity', 'corrected_title'],
+  required: ['verdicts'],
   properties: {
-    refuted: { type: 'boolean' },
-    reason: { type: 'string' },
-    severity: { type: 'string', enum: ['high', 'medium', 'low'] },
-    corrected_title: { type: 'string' },
+    verdicts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['id', ...VERDICT_REQUIRED],
+        properties: { id: { type: 'string' }, ...VERDICT_FIELDS },
+      },
+    },
   },
 }
-const schema = args.phase === 'hunt' ? FINDINGS_SCHEMA : VERDICT_SCHEMA
+const schema = args.phase === 'hunt' ? FINDINGS_SCHEMA
+  : args.batched ? BATCH_VERDICT_SCHEMA : VERDICT_SCHEMA
 
 log(`${args.prompt_files.length} ${args.phase} agents`)
 
 const results = await parallel(args.prompt_files.map(file => () =>
   agent(
-    `Your complete instructions are in the file ${file}. Read it in full and carry it out exactly: it names the repository, what to read first, what to report, the JSON object to return, and the one file you may write. Write that file before you reply.`,
-    { label: `${args.phase}:${file.split('/').pop().replace(/\.md$/, '')}`, phase, schema, agentType: readOnly },
+    `Your complete instructions are in the file ${file}. Read it in full and carry it out exactly: it names the repository, what to read first, what to report, the JSON object to return, and the files you may write. Write them before you reply.`,
+    {
+      label: `${args.phase}:${file.split('/').pop().replace(/\.md$/, '')}`,
+      phase, schema, agentType: readOnly,
+      ...(args.agent_model ? { model: args.agent_model } : {}),
+    },
   ).then(r => ({ file, ok: !!r })).catch(e => ({ file, ok: false, error: String(e) }))
 ))
 

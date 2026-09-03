@@ -72,9 +72,14 @@ act on.
 
 Output: `{"findings":[{file, line, verdict, title, evidence, behavior, change}]}`.
 
-## Skeptic — one per finding, both tracks
+## Skeptic — one per hunt, both tracks
 
-Job: refute. Default `refuted=true`. Reads the notes (a documented gotcha or
+Job: refute. Default `refuted=true`. One skeptic takes the findings of one
+hunt, reads the notes and that subsystem's sources once, then judges each
+finding on its own and writes it its own verdict file; the findings do not
+support each other, and the last one gets the reading the first one got.
+`--solo` puts one skeptic on each finding instead, at one cold read per
+finding. Either way the skeptic reads the notes (a documented gotcha or
 platform constraint refutes unless the reviewer showed the note no longer
 applies), reads the whole enclosing function and type (does the snippet exist
 and behave as claimed), traces the failure or greps every symbol claimed

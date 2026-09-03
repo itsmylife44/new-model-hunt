@@ -2,7 +2,11 @@
 """new-model-hunt run tooling. Every prompt's wording lives here.
 
     hunt.py prompts  run.json   write prompts/{correctness,clarity}-<key>.md
-    hunt.py skeptics run.json   write skeptics/<track>-<key>-<n>.md for findings without a verdict
+    hunt.py skeptics run.json   write one skeptic prompt per hunt for findings without a verdict
+                                [--batch N] findings per prompt, default 8; --solo is --batch 1
+                                [--no-prefilter] keep findings whose file:line anchor does not exist
+                                [--no-dedup] keep findings that repeat another finding's defect
+    hunt.py plan     run.json   agents pending per phase, and skeptic count at each batch size
     hunt.py status   run.json   list expected outputs that are missing or unparsable
     hunt.py report   run.json   write REPORT.md, PATCHLIST.md, patch-common.md
     hunt.py args     run.json hunt|skeptics   print the args JSON for workflows/hunt.js (prompts still pending)
@@ -10,11 +14,13 @@
 run.json:
   { "root": "<abs repo>", "notes": ["<abs path>", ...], "model": "<name>", "run_dir": "<abs dir>",
     "tracks": ["correctness", "clarity"],            # optional, default both
+    "models": { "hunt": "<name>", "skeptic": "<name>", "patch": "<name>" },   # optional, per role
     "subsystems": [ { "key": "...", "files": "..." } ],
     "lenses":     [ { "key": "...", "files": "...", "focus": "..." } ] }
 
 Layout under run_dir: prompts/ findings/ skeptics/ verdicts/ REPORT.md PATCHLIST.md patch-common.md
 A verdict file may be {"alias": "<track>-<key>-<n>"} to fold a duplicate under the original.
+skeptics/batches.json maps each skeptic prompt to the finding ids it adjudicates.
 """
 import glob
 import json
@@ -103,53 +109,6 @@ Precision: every finding names the file and the 1-indexed line where the change 
 Return a single JSON object: {{"findings": [ {{"file": "<repo-relative path>", "line": <1-indexed int>, "verdict": "Bug|Delete|Derive|Fold|Simplify", "title": "<one line, <= 90 chars>", "evidence": "<what the code does, citing exact lines/symbols; quote the key snippet>", "behavior": "<for Bug: concrete inputs -> wrong result. Otherwise: the observable behaviour that is unchanged, and the concept count removed>", "change": "<the concrete edit in 1-3 sentences>"}} ] }}. No prose outside the JSON.
 
 Before replying, write the exact same JSON object to {out} (create it; it is outside the repository and is the only file you may write).
-"""
-
-SKEPTIC_CORRECTNESS = """You are the skeptic. A reviewer reported this correctness defect in the repository at {root}. Your job is to REFUTE it. Default to refuted=true when the failure does not follow from the code.
-
-Finding (from hunt "{key}"):
-  file: {file}
-  line: {line}
-  title: {title}
-  evidence: {evidence}
-  failure: {failure}
-  proposed fix: {fix}
-
-Procedure:
-1. Read {notes}. If the notes state that this exact scenario is intentional or impossible (a documented gotcha, a platform constraint, an authenticated boundary), the finding is refuted unless the reviewer shows the note's reasoning no longer matches the code.
-2. Open {file} around line {line}, read the whole enclosing function and type, and check that the quoted snippet exists and behaves as claimed.
-3. Trace the failure path yourself, reading every file it crosses. Confirm each step. One step that does not hold refutes it.
-4. Check the repository's tests: if a test already exercises this path and passes, explain why the finding is still real or refute it. If no test covers it, say so in reason — the patcher will add one.
-5. Check whether the proposed fix adds a speculative guard or a new concept. If the defect is real but the fix is over-guarding, keep refuted=false and say in reason what the minimal fix is.
-6. A duplicate of a scenario the notes already document as fixed, or a purely theoretical concern (a malicious peer, a lying kernel), is refuted.
-
-Return refuted=false only when you can narrate the failure end to end from the code. If the finding stands but is misstated or mis-anchored, keep refuted=false and give a corrected_title.
-
-Do NOT modify any file in the repository. Return a single JSON object with exactly these keys: refuted (boolean), reason (string: the decisive fact with file:line), severity ("high" = data loss, hang, crash, or a wrong result a user will hit; "medium" = wrong result on a plausible but uncommon path; "low" = latent, needs an unusual input), corrected_title (string, empty if the title stands). Before replying, write that same JSON object to {out} (the only file you may write). Your reply must be only the JSON.
-"""
-
-SKEPTIC_CLARITY = """You are the skeptic. A code-clarity reviewer reported this finding in the repository at {root}. Your job is to REFUTE it. Default to refuted=true when the evidence does not hold up.
-
-Finding (subsystem "{key}"):
-  file: {file}
-  line: {line}
-  verdict: {verdict}
-  title: {title}
-  evidence: {evidence}
-  behavior: {behavior}
-  proposed change: {change}
-
-Procedure:
-1. Read {notes}. If the notes document a reason for exactly this concept (a gotcha that bit the project, a platform limit, a resource constraint), the finding is refuted unless the reviewer's evidence shows the note no longer applies.
-2. Open {file} around line {line} and read the whole surrounding type/function. Check that the quoted snippet exists and does what the reviewer says.
-3. grep the repository for every symbol the finding says is unused, duplicated, or unreachable. A single real reader or a real caller that behaves differently refutes a Delete/Derive/Fold.
-4. For a Bug, trace the concrete inputs the reviewer gave. If the bad outcome does not follow, refuted. If it follows only for an input the notes rule out, refuted.
-5. For a clarity verdict: would deleting/deriving/folding this change any observable behaviour for a supported scenario? Would the proposed change ADD a guard, a branch, a type, a protocol, a wrapper, a mode, or a file instead of removing one? If so, refuted — the user has asked for no over-guarding and no over-design.
-6. Style-only or taste findings (formatting, naming without a lying name, "could be an actor") are refuted.
-
-Return refuted=false only when the finding is accurate, anchored, and actionable. If it stands but the reviewer overstated it or anchored it to the wrong place, keep refuted=false and give a corrected_title.
-
-Do NOT modify any file in the repository. Return a single JSON object with exactly these keys: refuted (boolean), reason (string: the decisive fact with file:line), severity ("high" = user-visible bug or a real correctness risk; "medium" = a concept a maintainer must understand that earns nothing; "low" = local tidy-up), corrected_title (string, empty if the title stands). Before replying, write that same JSON object to {out} (the only file you may write). Your reply must be only the JSON.
 """
 
 PATCH_COMMON = """# Common rules for every patch agent
@@ -260,20 +219,209 @@ def status(run):
     print(f'verdicts: {total - pending}/{total} present' + (f', {pending} pending' if pending else ''))
 
 
-def write_skeptics(run):
+# The bar and the procedure are written once here and shared by the solo and the
+# batched prompt, so changing the skeptic's standard is a one-place edit.
+
+SEVERITY_CORRECTNESS = ('"high" = data loss, hang, crash, or a wrong result a user will hit; '
+                        '"medium" = wrong result on a plausible but uncommon path; '
+                        '"low" = latent, needs an unusual input')
+SEVERITY_CLARITY = ('"high" = user-visible bug or a real correctness risk; '
+                    '"medium" = a concept a maintainer must understand that earns nothing; '
+                    '"low" = local tidy-up')
+
+PROCEDURE_CORRECTNESS = """1. Judge it against the notes. If they state that this exact scenario is intentional or impossible (a documented gotcha, a platform constraint, an authenticated boundary), the finding is refuted unless the reviewer shows the note's reasoning no longer matches the code.
+2. Open the finding's file around its line, read the whole enclosing function and type, and check that the quoted snippet exists and behaves as claimed.
+3. Trace the failure path yourself, reading every file it crosses. Confirm each step. One step that does not hold refutes it.
+4. Check the repository's tests: if a test already exercises this path and passes, explain why the finding is still real or refute it. If no test covers it, say so in reason — the patcher will add one.
+5. Check whether the proposed fix adds a speculative guard or a new concept. If the defect is real but the fix is over-guarding, keep refuted=false and say in reason what the minimal fix is.
+6. A duplicate of a scenario the notes already document as fixed, or a purely theoretical concern (a malicious peer, a lying kernel), is refuted.
+
+Return refuted=false only when you can narrate the failure end to end from the code. When a finding stands but is misstated or mis-anchored, keep refuted=false and give a corrected_title."""
+
+PROCEDURE_CLARITY = """1. Judge it against the notes. If they document a reason for exactly this concept (a gotcha that bit the project, a platform limit, a resource constraint), the finding is refuted unless the reviewer's evidence shows the note no longer applies.
+2. Open the finding's file around its line and read the whole surrounding type/function. Check that the quoted snippet exists and does what the reviewer says.
+3. grep the repository for every symbol the finding says is unused, duplicated, or unreachable. A single real reader or a real caller that behaves differently refutes a Delete/Derive/Fold.
+4. For a Bug, trace the concrete inputs the reviewer gave. If the bad outcome does not follow, refuted. If it follows only for an input the notes rule out, refuted.
+5. For a clarity verdict: would deleting/deriving/folding this change any observable behaviour for a supported scenario? Would the proposed change ADD a guard, a branch, a type, a protocol, a wrapper, a mode, or a file instead of removing one? If so, refuted — the user has asked for no over-guarding and no over-design.
+6. Style-only or taste findings (formatting, naming without a lying name, "could be an actor") are refuted.
+
+Return refuted=false only when the finding is accurate, anchored, and actionable. When a finding stands but the reviewer overstated it or anchored it to the wrong place, keep refuted=false and give a corrected_title."""
+
+FINDING_CORRECTNESS = """--- FINDING {fid} ---
+  file: {file}
+  line: {line}
+  title: {title}
+  evidence: {evidence}
+  failure: {failure}
+  proposed fix: {fix}
+  WRITE VERDICT TO: {out}
+"""
+
+FINDING_CLARITY = """--- FINDING {fid} ---
+  file: {file}
+  line: {line}
+  verdict: {verdict}
+  title: {title}
+  evidence: {evidence}
+  behavior: {behavior}
+  proposed change: {change}
+  WRITE VERDICT TO: {out}
+"""
+
+SKEPTIC_SOLO = """You are the skeptic. A reviewer reported this {kind} in the repository at {root}. Your job is to REFUTE it. Default to refuted=true when the evidence does not hold up.
+
+Read {notes} — the repository's agent notes — then the whole enclosing type or function of the anchor below.
+
+Finding (from hunt "{key}"):
+{finding}
+Procedure:
+{procedure}
+
+Do NOT modify any file in the repository. Return a single JSON object with exactly these keys: refuted (boolean), reason (string: the decisive fact with file:line), severity ({severity}), corrected_title (string, empty if the title stands). Before replying, write that same JSON object to the WRITE VERDICT TO path above (the only file you may write). Your reply must be only the JSON.
+"""
+
+SKEPTIC_BATCH = """You are the skeptic. {n} findings below were reported in the repository at {root} by the {track} hunt "{key}". Your job is to REFUTE each one. Default to refuted=true when the evidence does not hold up.
+
+Judge every finding on its own merits. They share this prompt so that you read the notes and the sources once; they do not support each other, and one finding standing tells you nothing about the next. Give the last finding the same reading you gave the first.
+
+Read this once, before you judge anything:
+1. {notes} — the repository's agent notes.
+2. These files, in full: {files}
+
+Then work through the findings one at a time, applying this procedure to each:
+{procedure}
+
+Do NOT modify any file in the repository.
+
+Return a single JSON object: {{"verdicts": [ {{"id": "<the FINDING id, copied exactly>", "refuted": <boolean>, "reason": "<the decisive fact with file:line>", "severity": {severity_enum}, "corrected_title": "<empty if the title stands>"}} ] }} — one entry per finding below, in the order given, {n} in total. Severity: {severity}. No prose outside the JSON.
+
+Before replying, write each verdict as its own file at that finding's WRITE VERDICT TO path: a JSON object with exactly the four keys refuted, reason, severity, corrected_title (no id). Those {n} files are the only files you may write.
+
+{findings}"""
+
+
+def _finding_block(fid, track, f, out):
+    tpl = FINDING_CORRECTNESS if track == 'correctness' else FINDING_CLARITY
+    fields = {k: f.get(k, '') for k in ('file', 'line', 'title', 'evidence', 'failure', 'fix',
+                                        'verdict', 'behavior', 'change')}
+    return tpl.format(fid=fid, out=out, **fields)
+
+
+def _anchor_miss(root, f):
+    """Why this finding's anchor cannot be read, or None when it can."""
+    rel = f.get('file')
+    if not rel:
+        return 'the finding names no file'
+    path = os.path.join(root, rel)
+    if not os.path.isfile(path):
+        return f'anchor does not exist: {rel} is not a file in the repository'
+    try:
+        line = int(f.get('line'))
+    except (TypeError, ValueError):
+        return f'anchor has no line number: {rel}:{f.get("line")!r}'
+    try:
+        with open(path, 'rb') as fh:
+            n = sum(1 for _ in fh)
+    except Exception:
+        return None
+    if line < 1 or line > n:
+        return f'anchor is off the end of the file: {rel}:{line}, which has {n} lines'
+    return None
+
+
+def _title_key(title):
+    return [w for w in re.findall(r'[a-z0-9]+', (title or '').lower()) if len(w) > 2]
+
+
+def _same_defect(a, b):
+    """Conservative: same file, anchors within 3 lines, and titles that mostly agree."""
+    if a.get('file') != b.get('file'):
+        return False
+    try:
+        if abs(int(a.get('line')) - int(b.get('line'))) > 3:
+            return False
+    except (TypeError, ValueError):
+        return False
+    ka, kb = set(_title_key(a.get('title'))), set(_title_key(b.get('title')))
+    if not ka or not kb:
+        return False
+    return len(ka & kb) / len(ka | kb) >= 0.6
+
+
+def write_skeptics(run, batch=8, prefilter=True, dedup=True):
     root, notes, run_dir = run['root'], notes_sentence(run), run['run_dir']
-    n = 0
-    for fid, track, key, f in iter_findings(run):
-        if os.path.exists(f'{run_dir}/verdicts/{fid}.json'):
-            continue
-        out = f'{run_dir}/verdicts/{fid}.json'
-        tpl = SKEPTIC_CORRECTNESS if track == 'correctness' else SKEPTIC_CLARITY
-        fields = {k: f.get(k, '') for k in ('file', 'line', 'title', 'evidence', 'failure', 'fix', 'verdict', 'behavior', 'change')}
-        p = f'{run_dir}/skeptics/{fid}.md'
-        open(p, 'w').write(tpl.format(root=root, notes=notes, key=key, out=out, **fields))
-        print(f"{p}  --  {f.get('file')}:{f.get('line')}  {f.get('title')}")
-        n += 1
-    print(f'{n} skeptic prompts. Scan for duplicates (same file, same defect): write {{"alias": "<id>"}} to the duplicate\'s verdict file instead of launching it.')
+    os.makedirs(f'{run_dir}/skeptics', exist_ok=True)
+
+    pending = [(fid, track, key, f) for fid, track, key, f in iter_findings(run)
+               if not os.path.exists(f'{run_dir}/verdicts/{fid}.json')]
+
+    refuted = []
+    if prefilter:
+        kept = []
+        for fid, track, key, f in pending:
+            miss = _anchor_miss(root, f)
+            if miss:
+                json.dump({'refuted': True, 'reason': miss, 'severity': 'low', 'corrected_title': ''},
+                          open(f'{run_dir}/verdicts/{fid}.json', 'w'))
+                refuted.append((fid, miss))
+            else:
+                kept.append((fid, track, key, f))
+        pending = kept
+
+    aliased = []
+    if dedup:
+        kept, seen = [], []
+        for fid, track, key, f in pending:
+            dup = next((sid for sid, sf in seen if _same_defect(sf, f)), None)
+            if dup:
+                json.dump({'alias': dup}, open(f'{run_dir}/verdicts/{fid}.json', 'w'))
+                aliased.append((fid, dup))
+            else:
+                seen.append((fid, f))
+                kept.append((fid, track, key, f))
+        pending = kept
+
+    groups = {}
+    for fid, track, key, f in pending:
+        groups.setdefault((track, key), []).append((fid, f))
+
+    manifest, written = {}, 0
+    for (track, key), items in sorted(groups.items()):
+        size = max(1, batch)
+        chunks = [items[i:i + size] for i in range(0, len(items), size)]
+        for n, chunk in enumerate(chunks, 1):
+            name = f'{track}-{key}' + (f'-b{n}' if len(chunks) > 1 else '')
+            path = f'{run_dir}/skeptics/{name}.md'
+            proc = PROCEDURE_CORRECTNESS if track == 'correctness' else PROCEDURE_CLARITY
+            sev = SEVERITY_CORRECTNESS if track == 'correctness' else SEVERITY_CLARITY
+            files = sorted({f.get('file', '?') for _, f in chunk})
+            blocks = ''.join(_finding_block(fid, track, f, f'{run_dir}/verdicts/{fid}.json')
+                             for fid, f in chunk)
+            if size == 1:
+                fid, f = chunk[0]
+                kind = 'correctness defect' if track == 'correctness' else 'code-clarity finding'
+                body = SKEPTIC_SOLO.format(
+                    root=root, key=key, kind=kind, procedure=proc, severity=sev, notes=notes,
+                    finding=_finding_block(fid, track, f, f'{run_dir}/verdicts/{fid}.json'))
+            else:
+                body = SKEPTIC_BATCH.format(
+                    root=root, track=track, key=key, n=len(chunk), notes=notes,
+                    files=', '.join(files), procedure=proc, severity=sev,
+                    severity_enum='"high" | "medium" | "low"', findings=blocks)
+            open(path, 'w').write(body)
+            manifest[path] = [fid for fid, _ in chunk]
+            written += 1
+            print(f'{path}  --  {len(chunk)} finding(s): {", ".join(files)}')
+
+    json.dump(manifest, open(f'{run_dir}/skeptics/batches.json', 'w'), indent=1)
+
+    for fid, why in refuted:
+        print(f'  auto-refuted  {fid}: {why}')
+    for fid, dup in aliased:
+        print(f'  auto-aliased  {fid} -> {dup}')
+    n = sum(len(v) for v in manifest.values())
+    print(f'{len(refuted)} auto-refuted (bad anchor), {len(aliased)} auto-aliased (duplicate), '
+          f'{n} findings in {written} skeptic prompts. Launch one agent per prompt.')
 
 
 # ----------------------------------------------------------------- report ----
@@ -372,21 +520,70 @@ def workflow_args(run, phase):
         files = [f'{run_dir}/prompts/{k}.md' for k in expected_findings(run)
                  if not os.path.exists(f'{run_dir}/findings/{k}.json')]
     else:
-        files = [f'{run_dir}/skeptics/{fid}.md' for fid, *_ in iter_findings(run)
-                 if not os.path.exists(f'{run_dir}/verdicts/{fid}.json')
-                 and os.path.exists(f'{run_dir}/skeptics/{fid}.md')]
-    print(json.dumps({'phase': phase, 'prompt_files': files}, indent=1))
+        manifest_path = f'{run_dir}/skeptics/batches.json'
+        manifest = load_json(manifest_path) if os.path.exists(manifest_path) else {}
+        files = [p for p, fids in sorted(manifest.items())
+                 if os.path.exists(p)
+                 and any(not os.path.exists(f'{run_dir}/verdicts/{fid}.json') for fid in fids)]
+    out = {'phase': phase, 'prompt_files': files}
+    if phase == 'skeptics':
+        out['batched'] = any(len(fids) > 1 for fids in manifest.values())
+    model = (run.get('models') or {}).get('hunt' if phase == 'hunt' else 'skeptic')
+    if model:
+        out['agent_model'] = model
+    print(json.dumps(out, indent=1))
+
+
+def plan(run):
+    """What the next phase will cost, before you spend it."""
+    run_dir = run['run_dir']
+    pending_hunts = [k for k in expected_findings(run)
+                     if not os.path.exists(f'{run_dir}/findings/{k}.json')]
+    findings = list(iter_findings(run))
+    pending = [f for f in findings if not os.path.exists(f"{run_dir}/verdicts/{f[0]}.json")]
+    print(f'hunt      {len(pending_hunts)} agents pending of {len(expected_findings(run))}')
+    print(f'findings  {len(findings)} so far ({len(pending)} without a verdict)')
+    if pending_hunts and findings:
+        rate = len(findings) / max(1, len(expected_findings(run)) - len(pending_hunts))
+        print(f'          ~{int(rate * len(pending_hunts))} more expected at {rate:.1f}/hunt')
+    groups = {}
+    for fid, track, key, f in pending:
+        groups[(track, key)] = groups.get((track, key), 0) + 1
+    for size in (1, 4, 8, 12):
+        n = sum(-(-c // size) for c in groups.values())
+        mark = '  <- default' if size == 8 else ('  <- one agent per finding' if size == 1 else '')
+        print(f'skeptics  --batch {size:2d}  ->  {n:4d} agents{mark}')
 
 
 def main():
-    cmds = {'prompts': write_prompts, 'skeptics': write_skeptics, 'status': status, 'report': report}
-    if len(sys.argv) == 4 and sys.argv[1] == 'args' and sys.argv[3] in ('hunt', 'skeptics'):
-        workflow_args(load_run(sys.argv[2]), sys.argv[3])
+    argv = sys.argv[1:]
+    flags = {'batch': 8, 'prefilter': True, 'dedup': True}
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--batch' and i + 1 < len(argv):
+            flags['batch'] = int(argv[i + 1]); i += 2
+        elif a == '--solo':
+            flags['batch'] = 1; i += 1
+        elif a == '--no-prefilter':
+            flags['prefilter'] = False; i += 1
+        elif a == '--no-dedup':
+            flags['dedup'] = False; i += 1
+        else:
+            rest.append(a); i += 1
+
+    if len(rest) == 3 and rest[0] == 'args' and rest[2] in ('hunt', 'skeptics'):
+        workflow_args(load_run(rest[1]), rest[2])
         return
-    if len(sys.argv) != 3 or sys.argv[1] not in cmds:
+    cmds = {'prompts': write_prompts, 'status': status, 'report': report, 'plan': plan}
+    if len(rest) == 2 and rest[0] == 'skeptics':
+        write_skeptics(load_run(rest[1]), **flags)
+        return
+    if len(rest) != 2 or rest[0] not in cmds:
         print(__doc__)
         sys.exit(64)
-    cmds[sys.argv[1]](load_run(sys.argv[2]))
+    cmds[rest[0]](load_run(rest[1]))
 
 
 if __name__ == '__main__':

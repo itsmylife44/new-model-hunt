@@ -1,6 +1,6 @@
 # New-model hunt
 
-A skill that runs a **whole-repository adversarial review** against a new model: parallel correctness hunters and code-clarity reviewers per subsystem, cross-cutting lenses, one skeptic per finding prompted to refute it, a report on the Desktop, then (if you want) per-subsystem patches, build/test, one commit per group, a UI-copy pass, and a release.
+A skill that runs a **whole-repository adversarial review** against a new model: parallel correctness hunters and code-clarity reviewers per subsystem, cross-cutting lenses, a skeptic per hunt prompted to refute each finding, a report on the Desktop, then (if you want) per-subsystem patches, build/test, one commit per group, a UI-copy pass, and a release.
 
 Every judgement is anchored, refuted by default, and forbids over-guarding and over-design. Zero findings for a clean area is a correct result.
 
@@ -48,7 +48,7 @@ The working tree must be clean (`git status --porcelain` empty). Run state lives
 
 1. **Carve** the tree into subsystems of at most ~3 000 lines, plus three cross-cutting lenses (`wire-contract`, `concurrency`, `lifecycle`).
 2. **Hunt** — one read-only agent per subsystem (and per lens on the correctness track). Each writes JSON under the run dir.
-3. **Skeptics** — one read-only agent per finding, prompted to refute it. Default is `refuted=true`.
+3. **Skeptics** — one read-only agent per hunt, carrying that hunt's findings and prompted to refute each. Default is `refuted=true`. Findings with an anchor that does not exist, or that repeat another finding, are settled by the script before any agent runs. `--solo` puts one agent on each finding.
 4. **Report** — confirmed findings by severity with evidence, failure, fix, and the skeptic's reason; refuted ones with why they fell. This is the model's scorecard.
 5. **Ask** — which set to patch. Default offer: all confirmed correctness, clarity in a second pass.
 6. **Patch** — one agent per disjoint file group. Surgical edits only; they never change git state or build into the repo.
