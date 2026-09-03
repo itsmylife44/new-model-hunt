@@ -67,12 +67,25 @@ new-model-hunt/
 │   ├── roles.md                # Hunter, reviewer, skeptic, patcher, orchestrator
 │   └── lessons.md              # What previous runs taught, and the rule each left
 ├── scripts/
-│   └── hunt.py                 # prompts · skeptics · status · report · args
+│   ├── hunt.py                 # prompts · skeptics · plan · status · report · args
+│   └── selftest.py             # anchors, duplicates, grouping, waves, resume, report
 └── workflows/
-    └── hunt.js                 # Optional Claude Code Workflow fan-out
+    ├── hunt.js                 # Optional Claude Code Workflow fan-out
+    └── selftest.mjs            # hunt.js fan-out and schema routing
 ```
 
-On Claude Code, `python3 scripts/hunt.py args run.json hunt|skeptics` prints the `args` for `workflows/hunt.js`. Anywhere else the orchestrator launches one subagent per prompt file.
+## Tests
+
+Neither test calls a model, touches the network, or needs a repository:
+
+```bash
+python3 scripts/selftest.py        # 52 checks on the run tooling
+node workflows/selftest.mjs        # 19 checks on the Workflow fan-out
+```
+
+On Claude Code, `python3 scripts/hunt.py args run.json hunt|skeptics` prints the `args` for `workflows/hunt.js`; add `--wave <n>` to take one wave at a time and see how many prompts remain. Anywhere else the orchestrator launches one subagent per prompt file.
+
+`run.json` accepts a `models` map (`hunt` / `skeptic` / `patch`) so the hunters run on the model under test while the skeptics verify on a cheaper one. Under the `Workflow` tool a model is chosen by agent definition rather than by name, so pass `skeptic_agent_type`.
 
 ## License
 

@@ -25,6 +25,7 @@ in the parent session (the exceptions are listed under Patch).
 | --- | --- |
 | `SKILL_DIR/scripts/hunt.py` | `prompts` · `skeptics` · `plan` · `status` · `report` · `args` — all prompt wording lives here |
 | `SKILL_DIR/workflows/hunt.js` | Claude Code `Workflow` fan-out over the prompt files — optional |
+| `SKILL_DIR/scripts/selftest.py` · `workflows/selftest.mjs` | Check the run tooling without spending an agent |
 | `SKILL_DIR/references/roles.md` | What each role is and the bar it is held to |
 | `SKILL_DIR/references/lessons.md` | What went wrong on previous runs and the rule each left behind |
 
@@ -49,11 +50,11 @@ Defaults: both tracks, patch after the user picks, no release.
 
 ## Budget
 
-Every agent is a fresh context that re-reads the notes and its own files, so **agent count is what the run costs**. `python3 "$SKILL_DIR/scripts/hunt.py" plan "$RUN/run.json"` prints the count for each phase before you spend it; show it to the user after the carve and again before phase 2.
+Every agent is a fresh context that re-reads the notes and its own files, so **agent count is what the run costs**.
 
-Launch in **waves** of `--max-agents`. State lives in `$RUN`, so a wave that dies against a rate or session limit costs one wave: rerun `hunt.py status` and relaunch what is missing. Between waves, tell the user how many agents are left.
+`hunt.py plan` prints the count for each phase, and `hunt.py args … --wave <n>` hands you at most `n` still-pending prompts and says how many remain after them. Launch a **wave**, wait for it, ask for the next. State lives in `$RUN`, so a wave that dies against a rate or session limit costs one wave: `hunt.py status` says what is missing.
 
-The hunters are the model under test and run on `--model`. The skeptics are the verification harness and run on `--skeptic-model`; a verifier independent of the model under test is the point of the phase, not a compromise. Record both under `models` in `run.json`, and pass the model on each agent launch.
+The hunters are the model under test and run on `--model`. The skeptics are the verification harness and run on `--skeptic-model`; a verifier independent of the model under test is the point of the phase, not a compromise. Record both under `models` in `run.json`. Pass the model on each agent launch where the host's launcher takes one; under the `Workflow` tool the model comes from the agent definition instead, so pass `skeptic_agent_type`.
 
 ## Phase 0 — Preflight and carve
 
@@ -76,16 +77,22 @@ EOF
 python3 "$SKILL_DIR/scripts/hunt.py" prompts "$RUN/run.json"
 ```
 
-Tell the user in two lines: N subsystems, M lenses, which tracks, where the run dir is.
+6. Print the budget and hand it to the user before spending it:
+
+```bash
+python3 "$SKILL_DIR/scripts/hunt.py" plan "$RUN/run.json"
+```
+
+Tell the user in two lines: N subsystems, M lenses, which tracks, where the run dir is — then `plan`'s agent counts, verbatim. The user decides whether that number is worth it; a count you paraphrased instead of ran is a count you guessed.
 
 ## Phase 1 — Hunt and review (parallel, read-only)
 
 One agent per prompt file under `$RUN/prompts/`. Correctness hunters (`correctness-<key>.md`) and clarity reviewers (`clarity-<key>.md`) run at the same time; they are independent. Each prompt already tells the agent to write its JSON to `$RUN/findings/<track>-<key>.json` and to touch nothing in the repo.
 
-- Launch them in waves of `--max-agents`, in the background. Read-only agent type when the host has one.
+- Launch them in waves, in the background, read-only agent type when the host has one. `python3 hunt.py args "$RUN/run.json" hunt --wave <--max-agents>` gives you one wave's prompt files and the count still pending; when the wave lands, ask for the next. Report the pending count to the user between waves.
 - Do **not** poll. Run `python3 hunt.py status "$RUN/run.json"` when a completion notice arrives, or when nothing has arrived for 20 minutes; it lists expected outputs that are still missing.
 - An agent that produced no file after ~60 minutes is stalled. Relaunch that one prompt (same file). Never wait on a stalled agent; never relaunch one that has written its file.
-- If the host has the Claude Code `Workflow` tool, `hunt.js` fans the agents out for you: `python3 hunt.py args "$RUN/run.json" hunt` prints the `args` to pass (only prompts still without a findings file). The agents write the same files, so nothing else in this skill changes; run it again with `args … skeptics` in phase 2.
+- If the host has the Claude Code `Workflow` tool, `hunt.js` fans the agents out for you: `python3 hunt.py args "$RUN/run.json" hunt` prints the `args` to pass (only prompts still without a findings file). Add `read_only_agent_type`, and for phase 2 `skeptic_agent_type` — `agent()` selects a model by agent definition, not by a model name, and `args` prints the name you need to map under `agent_type_hint`. The agents write the same files, so nothing else in this skill changes; run it again with `args … skeptics` in phase 2.
 
 ## Phase 2 — Skeptics (parallel, read-only, refute by default)
 
@@ -100,7 +107,9 @@ Two things the command settles before any agent runs, and prints:
 - A finding whose `file:line` anchor does not exist in the repo is refuted on the spot — a hallucinated anchor is the cheapest refutation there is, and it costs no agent.
 - A finding that repeats another's defect (same file, anchors within 3 lines, titles that agree) is aliased to it, and the report folds it under the original. This is the duplicate scan the orchestrator used to do by eye.
 
-Each skeptic writes one `verdicts/<id>.json` per finding, so `status` and `report` read the same layout as ever. Launch the prompts in waves, as in phase 1.
+Each skeptic writes one `verdicts/<id>.json` per finding, so `status` and `report` read the same layout as ever.
+
+Then run `hunt.py plan "$RUN/run.json"` again and give the user its skeptic counts before launching, the same way phase 0 did. Launch in waves via `hunt.py args … skeptics --wave <n>`, as in phase 1.
 
 The skeptic's bar (in the prompt): the finding stands only when the failure can be narrated end to end from the code, is not something the notes rule out, and its fix does not add a speculative guard or a new concept. A misplaced or overstated finding that survives gets a `corrected_title`; the corrected title is what the report shows and what the patcher follows.
 

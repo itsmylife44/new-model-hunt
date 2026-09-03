@@ -10,6 +10,7 @@
     hunt.py status   run.json   list expected outputs that are missing or unparsable
     hunt.py report   run.json   write REPORT.md, PATCHLIST.md, patch-common.md
     hunt.py args     run.json hunt|skeptics   print the args JSON for workflows/hunt.js (prompts still pending)
+                                [--wave N] cap the batch at N prompts and report how many remain
 
 run.json:
   { "root": "<abs repo>", "notes": ["<abs path>", ...], "model": "<name>", "run_dir": "<abs dir>",
@@ -324,7 +325,7 @@ def _anchor_miss(root, f):
             n = sum(1 for _ in fh)
     except Exception:
         return None
-    if line < 1 or line > n:
+    if line < 1 or line > n + 1:   # n+1 is a legitimate end-of-file anchor
         return f'anchor is off the end of the file: {rel}:{line}, which has {n} lines'
     return None
 
@@ -356,6 +357,9 @@ def write_skeptics(run, batch=8, prefilter=True, dedup=True):
                if not os.path.exists(f'{run_dir}/verdicts/{fid}.json')]
 
     refuted = []
+    if prefilter and not os.path.isdir(root):
+        print(f'root {root} is not a directory here: skipping the anchor check')
+        prefilter = False
     if prefilter:
         kept = []
         for fid, track, key, f in pending:
@@ -514,7 +518,7 @@ def report(run):
     print(f'wrote {run_dir}/REPORT.md, PATCHLIST.md ({len(conf)} confirmed across {len(by_file)} files), patch-common.md')
 
 
-def workflow_args(run, phase):
+def workflow_args(run, phase, wave=0):
     run_dir = run['run_dir']
     if phase == 'hunt':
         files = [f'{run_dir}/prompts/{k}.md' for k in expected_findings(run)
@@ -522,15 +526,24 @@ def workflow_args(run, phase):
     else:
         manifest_path = f'{run_dir}/skeptics/batches.json'
         manifest = load_json(manifest_path) if os.path.exists(manifest_path) else {}
+        if not manifest:
+            # A run started before skeptics were grouped has one prompt per finding id.
+            manifest = {f'{run_dir}/skeptics/{fid}.md': [fid] for fid, *_ in iter_findings(run)}
         files = [p for p, fids in sorted(manifest.items())
                  if os.path.exists(p)
                  and any(not os.path.exists(f'{run_dir}/verdicts/{fid}.json') for fid in fids)]
+    pending = len(files)
+    if wave > 0:
+        files = files[:wave]
     out = {'phase': phase, 'prompt_files': files}
     if phase == 'skeptics':
         out['batched'] = any(len(fids) > 1 for fids in manifest.values())
     model = (run.get('models') or {}).get('hunt' if phase == 'hunt' else 'skeptic')
     if model:
-        out['agent_model'] = model
+        out['agent_model'] = model            # for a host whose agent launcher takes a model
+        out['agent_type_hint'] = model        # for one that picks the model by agent definition
+    if wave > 0:
+        out['wave'] = {'launching': len(files), 'still_pending_after': pending - len(files)}
     print(json.dumps(out, indent=1))
 
 
@@ -558,6 +571,7 @@ def plan(run):
 def main():
     argv = sys.argv[1:]
     flags = {'batch': 8, 'prefilter': True, 'dedup': True}
+    wave = 0
     rest = []
     i = 0
     while i < len(argv):
@@ -570,11 +584,13 @@ def main():
             flags['prefilter'] = False; i += 1
         elif a == '--no-dedup':
             flags['dedup'] = False; i += 1
+        elif a == '--wave' and i + 1 < len(argv):
+            wave = int(argv[i + 1]); i += 2
         else:
             rest.append(a); i += 1
 
     if len(rest) == 3 and rest[0] == 'args' and rest[2] in ('hunt', 'skeptics'):
-        workflow_args(load_run(rest[1]), rest[2])
+        workflow_args(load_run(rest[1]), rest[2], wave)
         return
     cmds = {'prompts': write_prompts, 'status': status, 'report': report, 'plan': plan}
     if len(rest) == 2 and rest[0] == 'skeptics':

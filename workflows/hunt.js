@@ -7,10 +7,14 @@
 //   python3 scripts/hunt.py skeptics run.json && python3 scripts/hunt.py args run.json skeptics # -> args
 //   Workflow({ scriptPath: "<SKILL_DIR>/workflows/hunt.js", args })
 //
-// args: { "phase": "hunt" | "skeptics", "prompt_files": ["<abs path>", ...], "read_only_agent_type": "Explore",
-//         "batched": true, "agent_model": "<name>" }
+// args: { "phase": "hunt" | "skeptics", "prompt_files": ["<abs path>", ...],
+//         "read_only_agent_type": "Explore", "skeptic_agent_type": "<agent>", "batched": true }
 // A batched skeptic prompt carries several findings and returns one verdict per finding; hunt.py
 // writes the files either way, so hunt.py status / report work unchanged.
+//
+// Model routing: agent() takes agentType, not a model, so point skeptic_agent_type at an agent
+// definition whose frontmatter pins the cheaper model. hunt.py args prints the model name under
+// agent_type_hint for you to map; it is not passed through as an option.
 // Every agent writes its JSON where its prompt says, so hunt.py status / report work unchanged.
 export const meta = {
   name: 'new-model-hunt',
@@ -26,7 +30,9 @@ if (!args || !Array.isArray(args.prompt_files) || !['hunt', 'skeptics'].includes
   throw new Error('args must be { phase: "hunt" | "skeptics", prompt_files: [...] } — from `hunt.py args run.json <phase>`')
 }
 
-const readOnly = args.read_only_agent_type || 'Explore'
+const agentType = (args.phase === 'skeptics' && args.skeptic_agent_type)
+  || args.read_only_agent_type
+  || 'Explore'
 const phase = args.phase === 'hunt' ? 'Hunt' : 'Verify'
 
 const FINDINGS_SCHEMA = {
@@ -72,15 +78,14 @@ const BATCH_VERDICT_SCHEMA = {
 const schema = args.phase === 'hunt' ? FINDINGS_SCHEMA
   : args.batched ? BATCH_VERDICT_SCHEMA : VERDICT_SCHEMA
 
-log(`${args.prompt_files.length} ${args.phase} agents`)
+log(`${args.prompt_files.length} ${args.phase} agents on ${agentType}`)
 
 const results = await parallel(args.prompt_files.map(file => () =>
   agent(
     `Your complete instructions are in the file ${file}. Read it in full and carry it out exactly: it names the repository, what to read first, what to report, the JSON object to return, and the files you may write. Write them before you reply.`,
     {
       label: `${args.phase}:${file.split('/').pop().replace(/\.md$/, '')}`,
-      phase, schema, agentType: readOnly,
-      ...(args.agent_model ? { model: args.agent_model } : {}),
+      phase, schema, agentType,
     },
   ).then(r => ({ file, ok: !!r })).catch(e => ({ file, ok: false, error: String(e) }))
 ))
